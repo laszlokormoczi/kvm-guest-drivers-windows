@@ -887,71 +887,6 @@ VOID DumpSystemMemoryRanges(LONGLONG Start, LONGLONG End)
 }
 
 //
-// Function with the same name was removed from WDK by Microsoft so this is functional
-// (but slow) equivalent.
-//
-
-ULONG RtlFindLongestRunSet(IN PRTL_BITMAP BitMapHeader, OUT PULONG StartingIndex)
-{
-    ULONG currentRunLength = 0;
-    ULONG longestRunFound = 0;
-    ULONG i = 0;
-    *StartingIndex = 0;
-
-    for (i = 0; i < BitMapHeader->SizeOfBitMap; i++)
-    {
-        if (RtlCheckBit(BitMapHeader, i) == TRUE)
-        {
-            currentRunLength++;
-        }
-        else
-        {
-            if (currentRunLength > longestRunFound)
-            {
-                longestRunFound = currentRunLength;
-                *StartingIndex = i - currentRunLength;
-            }
-        }
-    }
-
-    if (currentRunLength > longestRunFound)
-    {
-        longestRunFound = currentRunLength;
-        *StartingIndex = i - currentRunLength;
-    }
-
-    return longestRunFound;
-}
-
-//
-// This function searches for a busy (used) memory range that starts at the given address and
-// is less or equal to LessOrEqualExpectedSizeInBlocks in size. If the function finds the range,
-// it fills in the physical address of the range and the range's size and returns a boolean value
-// of TRUE. Otherwise, it returns a boolean value of FALSE.
-//
-
-inline BOOLEAN FindAllocatedMemoryRangeInBitmap(RTL_BITMAP *Bitmap,
-                                                LONGLONG BaseAddress,
-                                                ULONGLONG BlockSize,
-                                                ULONG LessOrEqualExpectedSizeInBlocks,
-                                                PPHYSICAL_MEMORY_RANGE RangeFound)
-{
-
-    ULONG indexOfContiguous = 0;
-    ULONG numberOfBits = RtlFindLongestRunSet(Bitmap, &indexOfContiguous);
-
-    if (numberOfBits)
-    {
-        numberOfBits = min(numberOfBits, LessOrEqualExpectedSizeInBlocks);
-        RangeFound->BaseAddress.QuadPart = BaseAddress + (indexOfContiguous * BlockSize);
-        RangeFound->NumberOfBytes.QuadPart = numberOfBits * BlockSize;
-        return TRUE;
-    }
-
-    return FALSE;
-}
-
-//
 // This function searches for a free memory range that starts at the given address and is less
 // or equal to LessOrEqualExpectedSizeInBlocks in size. If the function finds the range,
 // it fills in the physical address of the range and the range's size and returns a boolean value
@@ -1105,8 +1040,6 @@ BOOLEAN VirtioMemRemovePhysicalMemory(IN WDFOBJECT Device, virtio_mem_config *Co
     TraceEvents(TRACE_LEVEL_INFORMATION, DBG_PNP, "%s Entry\n", __FUNCTION__);
 
     NTSTATUS status = STATUS_SUCCESS;
-    BOOLEAN result = FALSE;
-    PHYSICAL_MEMORY_RANGE range = {0};
     PHYSICAL_ADDRESS highAddress = {0};
     LONGLONG sizeDifference = 0;
     __virtio16 numberOfBlocks = 0;
@@ -1124,26 +1057,6 @@ BOOLEAN VirtioMemRemovePhysicalMemory(IN WDFOBJECT Device, virtio_mem_config *Co
 #endif
 
     sizeDifference = (LONGLONG)(Configuration->plugged_size - Configuration->requested_size);
-
-    //
-    // Find the allocated block of memory that is less or equal to the size difference.
-    //
-
-    result = FindAllocatedMemoryRangeInBitmap(&devCtx->memoryBitmapHandle,
-                                              address.QuadPart,
-                                              Configuration->block_size,
-                                              (ULONG)(sizeDifference / Configuration->block_size),
-                                              &range);
-
-    if (!result)
-    {
-        TraceEvents(TRACE_LEVEL_INFORMATION,
-                    DBG_PNP,
-                    "%s FindAllocatedMemoryRangeInBitmap failed FALSE\n",
-                    __FUNCTION__);
-
-        return FALSE;
-    }
 
     //
     // Let's *try* to remove a memory range.
@@ -1172,20 +1085,19 @@ BOOLEAN VirtioMemRemovePhysicalMemory(IN WDFOBJECT Device, virtio_mem_config *Co
     ULONG flagsContigRemove = MM_ALLOCATE_REQUIRE_CONTIGUOUS_CHUNKS | MM_ALLOCATE_AND_HOT_REMOVE;
 
     //
-    // Trace information about the block to be removed.
+    // Search the entire usable device-managed region for pages to hot-remove.
+    // The byte count limits how much memory is removed; the address range
+    // must cover the usable region because plugged blocks need not be adjacent.
     //
 
-    LONGLONG startAddress = range.BaseAddress.QuadPart;
-    LONGLONG endAddress = startAddress + (range.NumberOfBytes.QuadPart - 1);
+    highAddress.QuadPart = address.QuadPart + (LONGLONG)Configuration->usable_region_size;
 
     TraceEvents(TRACE_LEVEL_INFORMATION,
                 DBG_PNP,
-                "Range to be removed: start[0x%.8I64x] end[0x%.8I64x] size[0x%.8I64x]\n",
-                startAddress,
-                endAddress,
-                range.NumberOfBytes.QuadPart);
-
-    highAddress.QuadPart = range.BaseAddress.QuadPart + range.NumberOfBytes.QuadPart;
+                "Hot-remove search range: start[0x%.8I64x] end[0x%.8I64x] requested size[0x%.8I64x]\n",
+                address.QuadPart,
+                highAddress.QuadPart - 1,
+                sizeDifference);
 
     //
     // Call the removal function - the mentioned MmAllocateNodePagesForMdlEx
@@ -1193,18 +1105,18 @@ BOOLEAN VirtioMemRemovePhysicalMemory(IN WDFOBJECT Device, virtio_mem_config *Co
 
 #if defined(_WIN64)
 
-    LONGLONG bytesToRemoveCount = range.NumberOfBytes.QuadPart;
+    LONGLONG bytesToRemoveCount = sizeDifference;
 
 #else
     //
     // Just a compilation fix for 32 bit platforms.
     //
 
-    SIZE_T bytesToRemoveCount = (SIZE_T)range.NumberOfBytes.QuadPart;
+    SIZE_T bytesToRemoveCount = (SIZE_T)sizeDifference;
 
 #endif
 
-    PMDL removedMemoryMdl = MmAllocateNodePagesForMdlEx(range.BaseAddress,
+    PMDL removedMemoryMdl = MmAllocateNodePagesForMdlEx(address,
                                                         highAddress,
                                                         skip,
                                                         bytesToRemoveCount,
