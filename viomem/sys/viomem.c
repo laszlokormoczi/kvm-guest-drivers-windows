@@ -733,6 +733,203 @@ ULONG GetMemoryRangesFromMdl(PMDL Mdl, PHYSICAL_MEMORY_RANGE MemoryRanges[])
 // region_size
 //
 
+//
+// Helper function used by HeapSortMemoryRanges to restore the max-heap property.
+//
+
+static VOID HeapSiftDownMemoryRanges(
+    PHYSICAL_MEMORY_RANGE MemoryRanges[],
+    ULONG Root,
+    ULONG Last)
+{
+    ULONG child;
+    PHYSICAL_MEMORY_RANGE temp;
+
+    for (;;)
+    {
+        child = Root * 2 + 1;
+
+        if (child > Last)
+        {
+            return;
+        }
+
+        //
+        // Select the child with the larger base address.
+        //
+
+        if (child < Last &&
+            MemoryRanges[child].BaseAddress.QuadPart <
+                MemoryRanges[child + 1].BaseAddress.QuadPart)
+        {
+            ++child;
+        }
+
+        if (MemoryRanges[Root].BaseAddress.QuadPart >=
+            MemoryRanges[child].BaseAddress.QuadPart)
+        {
+            return;
+        }
+
+        temp = MemoryRanges[Root];
+        MemoryRanges[Root] = MemoryRanges[child];
+        MemoryRanges[child] = temp;
+
+        Root = child;
+    }
+}
+
+//
+// Sort physical memory ranges by ascending base address in O(n log n) time.
+// The sort is in-place and does not require an auxiliary array.
+//
+
+static VOID HeapSortMemoryRanges(
+    PHYSICAL_MEMORY_RANGE MemoryRanges[],
+    ULONG RangeCount)
+{
+    ULONG start;
+    ULONG end;
+    PHYSICAL_MEMORY_RANGE temp;
+
+    if (RangeCount < 2)
+    {
+        return;
+    }
+
+    //
+    // Build a max-heap.
+    //
+
+    start = RangeCount / 2;
+
+    while (start > 0)
+    {
+        --start;
+        HeapSiftDownMemoryRanges(MemoryRanges, start, RangeCount - 1);
+    }
+
+    //
+    // Move the largest element to the end, then restore the heap.
+    //
+
+    for (end = RangeCount - 1; end > 0; --end)
+    {
+        temp = MemoryRanges[0];
+        MemoryRanges[0] = MemoryRanges[end];
+        MemoryRanges[end] = temp;
+
+        HeapSiftDownMemoryRanges(MemoryRanges, 0, end - 1);
+    }
+}
+
+//
+// Function sorts memory ranges and merges overlapping or adjacent ranges.
+// It logs each final merged range when that range is complete.
+//
+
+ULONG SortAndMergeMemoryRanges(
+    PHYSICAL_MEMORY_RANGE MemoryRanges[],
+    ULONG RangeCount)
+{
+    ULONG i;
+    ULONG mergedCount = 0;
+    PHYSICAL_MEMORY_RANGE *current;
+    LONGLONG currentEnd;
+    LONGLONG nextStart;
+    LONGLONG nextEnd;
+
+    TraceEvents(TRACE_LEVEL_INFORMATION,
+                DBG_PNP,
+                "%s Entry\n",
+                __FUNCTION__);
+
+    if (MemoryRanges == NULL || RangeCount == 0)
+    {
+        TraceEvents(TRACE_LEVEL_INFORMATION,
+                    DBG_PNP,
+                    "%s Return [0]\n",
+                    __FUNCTION__);
+
+        return 0;
+    }
+
+    //
+    // The PFN order is not assumed; sort the extracted ranges first.
+    //
+
+    HeapSortMemoryRanges(MemoryRanges, RangeCount);
+
+    //
+    // Merge the sorted ranges in place. Log a range only when a gap proves
+    // that it is complete; this avoids a second pass for tracing.
+    //
+
+    for (i = 0; i < RangeCount; i++)
+    {
+        if (mergedCount == 0)
+        {
+            MemoryRanges[mergedCount++] = MemoryRanges[i];
+            continue;
+        }
+
+        current = &MemoryRanges[mergedCount - 1];
+
+        currentEnd = current->BaseAddress.QuadPart +
+                     current->NumberOfBytes.QuadPart;
+        nextStart = MemoryRanges[i].BaseAddress.QuadPart;
+        nextEnd = nextStart + MemoryRanges[i].NumberOfBytes.QuadPart;
+
+        if (nextStart <= currentEnd)
+        {
+            //
+            // The ranges overlap or are adjacent. Extend the current range
+            // only when the next range reaches farther.
+            //
+
+            if (nextEnd > currentEnd)
+            {
+                current->NumberOfBytes.QuadPart =
+                    nextEnd - current->BaseAddress.QuadPart;
+            }
+        }
+        else
+        {
+            //
+            // The gap finalizes the current merged range.
+            //
+
+            TraceEvents(TRACE_LEVEL_INFORMATION,
+                        DBG_PNP,
+                        "Found merged block at address 0x%.8I64x of size 0x%.8I64x\n",
+                        current->BaseAddress.QuadPart,
+                        current->NumberOfBytes.QuadPart);
+
+            MemoryRanges[mergedCount++] = MemoryRanges[i];
+        }
+    }
+
+    //
+    // The last merged range is finalized when the scan ends.
+    //
+
+    current = &MemoryRanges[mergedCount - 1];
+
+    TraceEvents(TRACE_LEVEL_INFORMATION,
+                DBG_PNP,
+                "Found merged block at address 0x%.8I64x of size 0x%.8I64x\n",
+                current->BaseAddress.QuadPart,
+                current->NumberOfBytes.QuadPart);
+
+    TraceEvents(TRACE_LEVEL_INFORMATION,
+                DBG_PNP,
+                "%s Return [%lu]\n",
+                __FUNCTION__,
+                mergedCount);
+
+    return mergedCount;
+}
+
 ULONG GetNumberOfMBytesAllocatedInBitmap(RTL_BITMAP *Bitmap, ULONG BlockSize)
 {
     ULONG number = RtlNumberOfSetBits(Bitmap);
@@ -1174,6 +1371,8 @@ BOOLEAN VirtioMemRemovePhysicalMemory(IN WDFOBJECT Device, virtio_mem_config *Co
         }
 
         GetMemoryRangesFromMdl(removedMemoryMdl, memoryRanges);
+
+        rangeCount = SortAndMergeMemoryRanges(memoryRanges, rangeCount);
 
         for (ULONG i = 0; i < rangeCount; i++)
         {
